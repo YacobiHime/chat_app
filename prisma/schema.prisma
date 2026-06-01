@@ -1,0 +1,40 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// プロット（物語のコンテナ）
+model Plot {
+  id           String         @id @default(cuid())
+  title        String
+  description  String
+  characters   Character[]
+  tokenProfile Json?
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+}
+
+// キャラクター
+model Character {
+  id          String   @id @default(cuid())
+  plotId      String
+  plot        Plot     @relation(fields: [plotId], references: [id], onDelete: Cascade)
+  name        String
+  avatar      String
+  personality String
+  speechStyle String
+  background  String
+  scenario    String
+  firstMessage String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([plotId])
+}
