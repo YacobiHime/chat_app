@@ -26,7 +26,7 @@ export async function getAllPlots(): Promise<Plot[]> {
       scenario: c.scenario,
       firstMessage: c.firstMessage,
     })),
-    tokenProfile: p.tokenProfile as TokenProfile | undefined,
+    tokenProfile: p.tokenProfile as unknown as TokenProfile | undefined,
     createdAt: p.createdAt.toISOString(),
     updatedAt: p.updatedAt.toISOString(),
   }));
@@ -59,7 +59,7 @@ export async function getPlotById(id: string): Promise<Plot | undefined> {
       scenario: c.scenario,
       firstMessage: c.firstMessage,
     })),
-    tokenProfile: plot.tokenProfile as TokenProfile | undefined,
+    tokenProfile: plot.tokenProfile as unknown as TokenProfile | undefined,
     createdAt: plot.createdAt.toISOString(),
     updatedAt: plot.updatedAt.toISOString(),
   };
@@ -74,34 +74,16 @@ export async function createPlot(
   const newPlot = await prisma.plot.create({
     data: {
       ...plotData,
-      tokenProfile,
+      tokenProfile: tokenProfile ? JSON.parse(JSON.stringify(tokenProfile)) : undefined,
       characters: {
-        create: characters,
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        create: characters.map(({ id, ...rest }) => rest),
       },
-    },
-    include: {
-      characters: true,
     },
   });
 
-  return {
-    id: newPlot.id,
-    title: newPlot.title,
-    description: newPlot.description,
-    characters: newPlot.characters.map((c) => ({
-      id: c.id,
-      name: c.name,
-      avatar: c.avatar,
-      personality: c.personality,
-      speechStyle: c.speechStyle,
-      background: c.background,
-      scenario: c.scenario,
-      firstMessage: c.firstMessage,
-    })),
-    tokenProfile: newPlot.tokenProfile as TokenProfile | undefined,
-    createdAt: newPlot.createdAt.toISOString(),
-    updatedAt: newPlot.updatedAt.toISOString(),
-  };
+  const result = await getPlotById(newPlot.id);
+  return result!;
 }
 
 // プロット更新
@@ -118,40 +100,22 @@ export async function updatePlot(
     });
   }
 
-  const updatedPlot = await prisma.plot.update({
+  await prisma.plot.update({
     where: { id },
     data: {
       ...plotData,
-      ...(tokenProfile !== undefined && { tokenProfile }),
+      ...(tokenProfile !== undefined && { tokenProfile: JSON.parse(JSON.stringify(tokenProfile)) }),
       ...(characters && {
         characters: {
-          create: characters,
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
+          create: characters.map(({ id, ...rest }) => rest),
         },
       }),
     },
-    include: {
-      characters: true,
-    },
   });
 
-  return {
-    id: updatedPlot.id,
-    title: updatedPlot.title,
-    description: updatedPlot.description,
-    characters: updatedPlot.characters.map((c) => ({
-      id: c.id,
-      name: c.name,
-      avatar: c.avatar,
-      personality: c.personality,
-      speechStyle: c.speechStyle,
-      background: c.background,
-      scenario: c.scenario,
-      firstMessage: c.firstMessage,
-    })),
-    tokenProfile: updatedPlot.tokenProfile as TokenProfile | undefined,
-    createdAt: updatedPlot.createdAt.toISOString(),
-    updatedAt: updatedPlot.updatedAt.toISOString(),
-  };
+  const result = await getPlotById(id);
+  return result;
 }
 
 // プロット削除
