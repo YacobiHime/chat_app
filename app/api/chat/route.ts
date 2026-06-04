@@ -2,8 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { ollamaClient, OLLAMA_MODEL } from "@/lib/ollama";
 import { getPlotById, getCharacterFromPlot } from "@/lib/plots";
 
-const THINK_START = "";
-const THINK_END = "";
+const THINK_START = "<think>";
+const THINK_END = "</think>";
 
 /**
  * URLからページタイトルを取得する
@@ -22,19 +22,12 @@ async function fetchPageTitle(url: string): Promise<string | undefined> {
 }
 
 /**
- * ストリームチャンクから  タグを解析し、
+ * ストリームチャンクから <think> タグを解析し、
  * reasoning / text を分けてSSEイベントとして流すジェネレーター。
  */
 async function* parseThinkingStream(
-  response: AsyncIterable<{
-    choices: Array<{
-      delta: {
-        content?: string | null;
-        reasoning?: string | null;
-        [key: string]: unknown;
-      };
-    }>;
-  }>,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  response: AsyncIterable<any>,
   controller?: ReadableStreamDefaultController,
   encoder?: TextEncoder
 ): AsyncGenerator<
@@ -74,13 +67,13 @@ async function* parseThinkingStream(
       yield { type: "tool_call", query };
 
       // ツール呼び出し後のバッファをリセット
-      buffer = buffer.substring(toolCallMatch.index + toolCallMatch[0].length);
+      buffer = buffer.substring(toolCallMatch.index! + toolCallMatch[0].length);
 
       // 続きのストリーミング
       continue;
     }
 
-    //  タグをパースしながらバッファを消費
+    // <think> タグをパースしながらバッファを消費
     while (true) {
       if (!inThinking) {
         const startIdx = buffer.indexOf(THINK_START);
@@ -324,7 +317,7 @@ call:web_search{query:<|"|>検索したい言葉<|"|>}<tool_call|>
     const stream = new ReadableStream({
       async start(controller) {
         try {
-          let messagesForContinuation = [...messagesWithSystem];
+          const messagesForContinuation = [...messagesWithSystem];
           let toolCallProcessed = false;
 
           for await (const event of parseThinkingStream(response, controller, encoder)) {
