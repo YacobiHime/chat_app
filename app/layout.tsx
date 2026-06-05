@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "zeta-clone - AIキャラクターチャット",
+  title: "zeta-clone",
   description: "AIキャラクターと自由にチャットできるアプリ",
 };
 
