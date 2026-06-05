@@ -32,7 +32,7 @@ async function* parseThinkingStream(
   encoder?: TextEncoder
 ): AsyncGenerator<
   | { type: "reasoning" | "text"; content: string }
-  | { type: "tool_call"; query: string }
+  | { type: "tool_call"; tool: string; query: string }
   | { type: "done" }
 > {
   let buffer = "";
@@ -52,19 +52,25 @@ async function* parseThinkingStream(
     buffer += raw;
 
     // テキストベースのツール呼び出しを検出（優先チェック）
-    const toolCallPattern = /call:web_search\{query:<\|"?\|>([^<]+)<\|"?\|>\}<tool_call\|>/;
-    const toolCallMatch = buffer.match(toolCallPattern);
+    const webSearchPattern = /call:web_search\{query:<\|"?\|>([^<]+)<\|"?\|>\}<tool_call\|>/;
+    const blueskySearchPattern = /call:bluesky_search\{query:<\|"?\|>([^<]+)<\|"?\|>\}<tool_call\|>/;
 
-    if (toolCallMatch) {
+    const webSearchMatch = buffer.match(webSearchPattern);
+    const blueskySearchMatch = buffer.match(blueskySearchPattern);
+
+    if (webSearchMatch || blueskySearchMatch) {
+      const match = webSearchMatch || blueskySearchMatch!;
+      const tool = webSearchMatch ? "web_search" : "bluesky_search";
+
       // ツール呼び出し前のテキストを流す
-      const beforeToolCall = buffer.substring(0, toolCallMatch.index);
+      const beforeToolCall = buffer.substring(0, match.index);
       if (beforeToolCall) {
         yield { type: "text", content: beforeToolCall };
       }
 
       // ツール呼び出しを検出
-      const query = toolCallMatch[1].trim();
-      yield { type: "tool_call", query };
+      const query = match[1].trim();
+      yield { type: "tool_call", tool, query };
 
       // ツール呼び出し後のバッファをリセット
       buffer = buffer.substring(toolCallMatch.index! + toolCallMatch[0].length);
@@ -127,6 +133,65 @@ async function* parseThinkingStream(
 }
 
 /**
+ * Blueskyで投稿を検索
+ */
+async function searchBluesky(
+  query: string,
+  controller?: ReadableStreamDefaultController,
+  encoder?: TextEncoder
+): Promise<Array<{ url: string; title: string; snippet: string }>> {
+  try {
+    const encodedQuery = encodeURIComponent(query);
+    const response = await fetch(`https://api.bsky.app/xrpc/app.bsky.feed.searchPosts?q=${encodedQuery}&limit=5`);
+
+    if (!response.ok) {
+      console.error("Bluesky search failed:", response.status);
+      return [];
+    }
+
+    const data = await response.json();
+    const results: Array<{ url: string; title: string; snippet: string }> = [];
+
+    if (data.posts && Array.isArray(data.posts)) {
+      for (const post of data.posts) {
+        const author = post.author?.displayName || post.author?.handle || "Bluesky User";
+        const text = post.record?.text || "";
+        const postUrl = post.uri?.replace("at://", "https://bsky.app/profile/")?.replace("/app.bsky.feed.post/", "/post/");
+
+        if (postUrl && text) {
+          // URL訪問イベントを送信（コントローラーがある場合）
+          if (controller && encoder) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+              search_url: postUrl,
+              url_status: "fetching"
+            })}\n\n`));
+
+            await new Promise(resolve => setTimeout(resolve, 100)); // 少し遅延を入れる
+
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+              search_url: postUrl,
+              url_status: "done",
+              url_title: `${author} (@${post.author?.handle})`
+            })}\n\n`));
+          }
+
+          results.push({
+            url: postUrl,
+            title: `${author} (@${post.author?.handle})`,
+            snippet: text
+          });
+        }
+      }
+    }
+
+    return results;
+  } catch (error) {
+    console.error("Bluesky error:", error);
+    return [];
+  }
+}
+
+/**
  * Web検索を実行し、URL訪問イベントを送信しながら結果を返す
  */
 async function performWebSearch(
@@ -134,6 +199,9 @@ async function performWebSearch(
   controller: ReadableStreamDefaultController,
   encoder: TextEncoder
 ): Promise<{ results: Array<{ url: string; title: string; snippet: string }>; urls: string[] }> {
+  const results: Array<{ url: string; title: string; snippet: string }> = [];
+  const urls: string[] = [];
+
   // DuckDuckGo Instant Answer API
   const encodedQuery = encodeURIComponent(query);
   const searchUrl = `https://api.duckduckgo.com/?q=${encodedQuery}&format=json`;
@@ -145,14 +213,11 @@ async function performWebSearch(
     }
 
     const data = await response.json();
-    const results: Array<{ url: string; title: string; snippet: string }> = [];
-    const urls: string[] = [];
 
     // メインのAbstractを処理
     if (data.Abstract && data.AbstractURL) {
       urls.push(data.AbstractURL);
 
-      // URL訪問イベントを送信（フェッチ開始）
       controller.enqueue(encoder.encode(`data: ${JSON.stringify({
         search_url: data.AbstractURL,
         url_status: "fetching"
@@ -160,7 +225,6 @@ async function performWebSearch(
 
       const title = await fetchPageTitle(data.AbstractURL);
 
-      // URL訪問イベントを送信（フェッチ完了）
       controller.enqueue(encoder.encode(`data: ${JSON.stringify({
         search_url: data.AbstractURL,
         url_status: "done",
@@ -178,9 +242,7 @@ async function performWebSearch(
     if (data.RelatedTopics && Array.isArray(data.RelatedTopics)) {
       for (const topic of data.RelatedTopics) {
         if (topic.FirstURL && topic.Text) {
-          // 既存のURLはスキップ
           if (urls.includes(topic.FirstURL)) continue;
-
           urls.push(topic.FirstURL);
 
           controller.enqueue(encoder.encode(`data: ${JSON.stringify({
@@ -203,12 +265,10 @@ async function performWebSearch(
           });
         }
 
-        // ネストされたTopics
         if (topic.Topics && Array.isArray(topic.Topics)) {
           for (const subTopic of topic.Topics) {
             if (subTopic.FirstURL && subTopic.Text) {
               if (urls.includes(subTopic.FirstURL)) continue;
-
               urls.push(subTopic.FirstURL);
 
               controller.enqueue(encoder.encode(`data: ${JSON.stringify({
@@ -234,12 +294,11 @@ async function performWebSearch(
         }
       }
     }
-
-    return { results, urls };
   } catch (error) {
-    console.error("Web search error:", error);
-    return { results: [], urls: [] };
+    console.error("DuckDuckGo search error:", error);
   }
+
+  return { results, urls };
 }
 
 export async function POST(req: NextRequest) {
@@ -275,13 +334,16 @@ ${character.background}
 【現在のシチュエーション】
 ${character.scenario}
 
-【Web検索機能】
-あなたはweb_searchツールを使ってインターネット検索ができます。
-検索が必要な場合は以下の形式でツールを呼び出してください：
-call:web_search{query:<|"|>検索したい言葉<|"|>}<tool_call|>
+【検索機能】
+あなたは以下のツールを使って検索ができます。
 
-ツールを呼ぶと、自動的に検索が行われ、結果が表示されます。
-その結果を元に、キャラクターとして自然な会話の形で答えてください。
+1. web_search - 一般的なWeb検索（DuckDuckGo）
+   call:web_search{query:<|"|>検索したい言葉<|"|>}<tool_call|>
+
+2. bluesky_search - Blueskyでの投稿検索
+   call:bluesky_search{query:<|"|>検索したい言葉<|"|>}<tool_call|>
+
+必要に応じて使い分けてください。検索結果を元に、キャラクターとして自然な会話の形で答えてください。
 `;
 
     if (plot.tokenProfile) {
@@ -310,6 +372,7 @@ call:web_search{query:<|"|>検索したい言葉<|"|>}<tool_call|>
       model: OLLAMA_MODEL,
       messages: messagesWithSystem,
       stream: true,
+      num_predict: 2048, // 生成トークン数を制限（推論を含む）
     });
 
     const encoder = new TextEncoder();
@@ -324,29 +387,41 @@ call:web_search{query:<|"|>検索したい言葉<|"|>}<tool_call|>
             if (event.type === "done") {
               controller.enqueue(encoder.encode("data: [DONE]\n\n"));
               controller.close();
+              break;
             } else if (event.type === "tool_call") {
               // ツール呼び出しを検出したら検索を実行
               toolCallProcessed = true;
 
+              const isWebSearch = event.tool === "web_search";
+              const toolName = isWebSearch ? "Web検索" : "Bluesky検索";
+
               // 検索中ステータスを送信
               controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                searchStatus: { stage: "thinking", query: event.query }
+                searchStatus: { stage: "thinking", query: event.query, tool: toolName }
               })}\n\n`));
 
-              await new Promise(resolve => setTimeout(resolve, 800));
+              await new Promise(resolve => setTimeout(resolve, 500));
 
               controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                searchStatus: { stage: "searching", query: event.query }
+                searchStatus: { stage: "searching", query: event.query, tool: toolName }
               })}\n\n`));
 
-              // Web検索実行（URL訪問イベントを送信しながら）
-              const { results } = await performWebSearch(event.query, controller, encoder);
+              let results: Array<{ url: string; title: string; snippet: string }>;
+
+              // ツールに応じて検索実行
+              if (isWebSearch) {
+                const webResult = await performWebSearch(event.query, controller, encoder);
+                results = webResult.results;
+              } else {
+                // Bluesky検索
+                results = await searchBluesky(event.query, controller, encoder);
+              }
 
               controller.enqueue(encoder.encode(`data: ${JSON.stringify({
                 searchStatus: { stage: "processing" }
               })}\n\n`));
 
-              await new Promise(resolve => setTimeout(resolve, 300));
+              await new Promise(resolve => setTimeout(resolve, 200));
 
               // 検索結果を送信
               controller.enqueue(encoder.encode(`data: ${JSON.stringify({
@@ -355,9 +430,13 @@ call:web_search{query:<|"|>検索したい言葉<|"|>}<tool_call|>
               })}\n\n`));
 
               // 検索結果をメッセージに追加して会話を継続
+              const formattedResults = results.map((r, i) =>
+                `${i + 1}. タイトル: ${r.title}\n   URL: ${r.url}\n   内容: ${r.snippet?.substring(0, 200)}${r.snippet && r.snippet.length > 200 ? "..." : ""}`
+              ).join("\n\n");
+
               messagesForContinuation.push({
                 role: "system",
-                content: `検索クエリ: ${event.query}\n検索結果: ${JSON.stringify(results)}\n\nこの検索結果を元に、キャラクターとして自然な会話の形で答えてください。`
+                content: `${toolName}クエリ: ${event.query}\n\n検索結果:\n${formattedResults || "(見つかりませんでした)"}\n\nこの検索結果を元に、キャラクターとして自然な会話の形で答えてください。`
               });
 
               // 続きのレスポンスを取得
@@ -365,6 +444,7 @@ call:web_search{query:<|"|>検索したい言葉<|"|>}<tool_call|>
                 model: OLLAMA_MODEL,
                 messages: messagesForContinuation,
                 stream: true,
+                num_predict: 2048, // 生成トークン数を制限（推論を含む）
               });
 
               // 再帰的にストリーミング
@@ -372,7 +452,7 @@ call:web_search{query:<|"|>検索したい言葉<|"|>}<tool_call|>
                 if (followUpEvent.type === "done") {
                   controller.enqueue(encoder.encode("data: [DONE]\n\n"));
                   controller.close();
-                  break;
+                  return; // returnに変更して外側のループも確実に抜ける
                 } else if (followUpEvent.type === "tool_call") {
                   // 二重ツール呼び出しは無視
                   controller.enqueue(encoder.encode(`data: ${JSON.stringify({
@@ -393,10 +473,6 @@ call:web_search{query:<|"|>検索したい言葉<|"|>}<tool_call|>
                 : { text: event.content };
               controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
             }
-          }
-
-          if (!toolCallProcessed) {
-            controller.close();
           }
         } catch (error) {
           console.error("Stream error:", error);

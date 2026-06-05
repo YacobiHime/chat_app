@@ -53,6 +53,7 @@ export default function ChatPage() {
   const [expandedReasoning, setExpandedReasoning] = useState<Set<number>>(new Set());
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const streamingReasoningRef = useRef<HTMLParagraphElement>(null);
 
   // プロット情報を取得
   useEffect(() => {
@@ -88,6 +89,13 @@ export default function ChatPage() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, streamingText, streamingReasoning]);
+
+  // 思考プロセスが更新されたら、思考エリアの一番下までスクロール
+  useEffect(() => {
+    if (streamingReasoningRef.current) {
+      streamingReasoningRef.current.scrollTop = streamingReasoningRef.current.scrollHeight;
+    }
+  }, [streamingReasoning]);
 
   // キャラクター切り替え時の処理
   const handleCharacterChange = (characterId: string) => {
@@ -282,7 +290,7 @@ export default function ChatPage() {
                   <div className="border-b border-gray-700">
                     <button
                       onClick={() => toggleReasoning(index)}
-                      className="w-full px-3 py-2 flex items-center gap-2 text-left text-gray-400 hover:text-gray-300 transition-colors"
+                      className="w-full px-3 py-2 flex items-center gap-2 text-left text-[#a855f7] hover:text-[#7c3aed] transition-colors"
                     >
                       <svg
                         className={`w-4 h-4 transition-transform ${expandedReasoning.has(index) ? "rotate-90" : ""}`}
@@ -316,13 +324,13 @@ export default function ChatPage() {
                 {/* 思考プロセス中 */}
                 {streamingReasoning && (
                   <div className="border-b border-gray-700 px-4 py-2">
-                    <div className="flex items-center gap-2 text-sm text-gray-500 mb-2">
+                    <div className="flex items-center gap-2 text-sm text-[#a855f7] mb-2">
                       <svg className="w-4 h-4 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                       </svg>
                       <span>思考中...</span>
                     </div>
-                    <p className="whitespace-pre-wrap text-sm text-gray-400 max-h-48 overflow-y-auto">
+                    <p ref={streamingReasoningRef} className="whitespace-pre-wrap text-sm text-gray-400 max-h-48 overflow-y-auto">
                       {streamingReasoning}
                       <span className="animate-pulse">▍</span>
                     </p>
