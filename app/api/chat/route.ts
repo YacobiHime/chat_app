@@ -25,9 +25,9 @@ async function* parseThinkingStream(
   // モデル固有のツール呼び出し構文
   // call:web_search{query:<|"|>クエリ<|"|>}<tool_call|>
   const WEB_SEARCH_RE =
-    /call:web_search\{query:<\|"?\|>([^<]+)<\|"?\|>\}<tool_call\|>/;
+    /call:web_search\{query:<\|"?\|>([\s\S]+?)<\|"?\|>\}(?:<tool_call\|>)?/; // <tool_call|> は省略される場合があるため optional
   const BLUESKY_RE =
-    /call:bluesky_search\{query:<\|"?\|>([^<]+)<\|"?\|>\}<tool_call\|>/;
+    /call:bluesky_search\{query:<\|"?\|>([\s\S]+?)<\|"?\|>\}(?:<tool_call\|>)?/; // <tool_call|> は省略される場合があるため optional
 
   for await (const chunk of response) {
     const delta = chunk.choices[0]?.delta;
@@ -49,9 +49,15 @@ async function* parseThinkingStream(
     // どちらかにマッチした方を使う（両方同時には来ない想定）
     const toolMatch = webMatch ?? bskyMatch;
 
+    // バッファに call: が含まれているが正規表現にまだマッチしない場合をデバッグ
+    if (!toolMatch && buffer.includes("call:")) {
+      console.log("[parseThinkingStream] call: を検出したがまだマッチなし, buffer(先頭200):", JSON.stringify(buffer.slice(0, 200)));
+    }
+
     if (toolMatch) {
       const tool = webMatch ? "web_search" : "bluesky_search";
       const matchIndex = toolMatch.index!;
+      console.log();
 
       // ツール呼び出し前のテキストを流す
       if (matchIndex > 0) {
@@ -71,11 +77,26 @@ async function* parseThinkingStream(
         const startIdx = buffer.indexOf(THINK_START);
 
         if (startIdx === -1) {
-          // <think> が来る可能性を残してバッファの末尾を保持
-          const safeLen = Math.max(0, buffer.length - (THINK_START.length - 1));
-          if (safeLen > 0) {
-            yield { type: "text", content: buffer.slice(0, safeLen) };
-            buffer = buffer.slice(safeLen);
+          // ツール呼び出しの先頭（"call:"）がバッファに含まれている場合は、
+          // そこより前だけをフラッシュし、"call:" 以降はバッファに保持する。
+          // こうしないと safeLen の計算で "ca" などが先に流れてしまい、
+          // 後続チャンクで "ll:web_search..." になって正規表現がマッチしなくなる。
+          const toolPrefixIdx = buffer.indexOf("call:");
+          let holdFrom: number;
+          if (toolPrefixIdx >= 0) {
+            // "call:" の手前までは安全にフラッシュできる
+            holdFrom = toolPrefixIdx;
+            if (holdFrom === 0) {
+              // バッファ全体がツール呼び出し候補 → 何もフラッシュしない
+              break;
+            }
+          } else {
+            // <think> が来る可能性を残してバッファの末尾を保持
+            holdFrom = Math.max(0, buffer.length - (THINK_START.length - 1));
+          }
+          if (holdFrom > 0) {
+            yield { type: "text", content: buffer.slice(0, holdFrom) };
+            buffer = buffer.slice(holdFrom);
           }
           break;
         }
@@ -114,6 +135,14 @@ async function* parseThinkingStream(
 
   // バッファ残りを吐き出す
   if (buffer.length > 0) {
+    // ストリーム終了時にまだ未完のツール呼び出しがバッファに残っている場合を警告
+    if (buffer.includes("call:")) {
+      console.warn(
+        "[parseThinkingStream] ストリーム終了時にツール呼び出しの可能性がある未処理バッファが残っています。\n" +
+        "  正規表現にマッチする前にストリームが終了した可能性があります。\n" +
+        "  buffer:", JSON.stringify(buffer.slice(0, 300))
+      );
+    }
     yield { type: inThinking ? "reasoning" : "text", content: buffer };
   }
 
@@ -193,7 +222,14 @@ async function performWebSearch(
   controller: ReadableStreamDefaultController,
   encoder: TextEncoder
 ): Promise<{ results: Array<{ url: string; title: string; snippet: string }>; urls: string[] }> {
+  console.log(`[performWebSearch] 検索開始 query="${query}"`);
   const results = await searxngSearch(query, 5);
+  console.log(`[performWebSearch] searxngSearch 完了 結果数=${results.length} query="${query}"`);
+
+  if (results.length === 0) {
+    console.warn(`[performWebSearch] 検索結果が 0 件 query="${query}" — SearXNG が起動しているか、SEARXNG_URL 環境変数を確認してください`);
+  }
+
   const urls: string[] = [];
 
   for (const r of results) {
@@ -333,6 +369,7 @@ ${character.scenario}
             if (event.type === "tool_call") {
               const isWebSearch = event.tool === "web_search";
               const toolName = isWebSearch ? "Web検索（SearXNG）" : "Bluesky検索";
+              console.log(`[API/chat] ツール呼び出しイベント受信 tool=${event.tool} query="${event.query.slice(0, 80)}"`);
 
               // 検索ステータスを送信
               sseJson(controller, encoder, {
