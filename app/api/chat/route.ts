@@ -7,6 +7,22 @@ const THINK_START = "<think>";
 const THINK_END = "</think>";
 
 // ============================================================
+//  モデル固有の生トークンをテキスト・reasoning から除去する
+//  例: to { thought: "..." } <|thought|>  /  <channel|>  など
+// ============================================================
+
+function sanitizeContent(text: string): string {
+  return text
+    // to { thought: "..." } <|thought|> ブロック全体を除去
+    .replace(/to\s*\{\s*thought:\s*"[\s\S]*?"\s*\}\s*<\|thought\|>/g, "")
+    // 残留する <|...|> 系トークンを除去
+    .replace(/<\|[^|]*\|>/g, "")
+    // <channel|> 等の亜種トークンを除去
+    .replace(/<[a-z_]+\|>/g, "")
+    .trimStart();
+}
+
+// ============================================================
 //  ストリームパーサー
 //  <think> タグ / ツール呼び出し構文を検出しながら SSE を流す
 // ============================================================
@@ -35,7 +51,7 @@ async function* parseThinkingStream(
     // モデルがネイティブ reasoning フィールドを持つ場合（例: QwQ）
     const nativeReasoning = (delta as { reasoning?: string | null }).reasoning;
     if (nativeReasoning) {
-      yield { type: "reasoning", content: nativeReasoning };
+      yield { type: "reasoning", content: sanitizeContent(nativeReasoning) };
     }
 
     const raw = delta?.content ?? "";
@@ -95,14 +111,14 @@ async function* parseThinkingStream(
             holdFrom = Math.max(0, buffer.length - (THINK_START.length - 1));
           }
           if (holdFrom > 0) {
-            yield { type: "text", content: buffer.slice(0, holdFrom) };
+            yield { type: "text", content: sanitizeContent(buffer.slice(0, holdFrom)) };
             buffer = buffer.slice(holdFrom);
           }
           break;
         }
 
         if (startIdx > 0) {
-          yield { type: "text", content: buffer.slice(0, startIdx) };
+          yield { type: "text", content: sanitizeContent(buffer.slice(0, startIdx)) };
           buffer = buffer.slice(startIdx);
         }
 
@@ -118,14 +134,14 @@ async function* parseThinkingStream(
         if (endIdx === -1) {
           const safeLen = Math.max(0, buffer.length - (THINK_END.length - 1));
           if (safeLen > 0) {
-            yield { type: "reasoning", content: buffer.slice(0, safeLen) };
+            yield { type: "reasoning", content: sanitizeContent(buffer.slice(0, safeLen)) };
             buffer = buffer.slice(safeLen);
           }
           break;
         }
 
         if (endIdx > 0) {
-          yield { type: "reasoning", content: buffer.slice(0, endIdx) };
+          yield { type: "reasoning", content: sanitizeContent(buffer.slice(0, endIdx)) };
         }
         buffer = buffer.slice(endIdx + THINK_END.length);
         inThinking = false;
@@ -143,7 +159,7 @@ async function* parseThinkingStream(
         "  buffer:", JSON.stringify(buffer.slice(0, 300))
       );
     }
-    yield { type: inThinking ? "reasoning" : "text", content: buffer };
+    yield { type: inThinking ? "reasoning" : "text", content: sanitizeContent(buffer) };
   }
 
   yield { type: "done" };
@@ -332,6 +348,7 @@ ${character.scenario}
 - AIであることや、モデル名・開発元には一切言及しないこと
 - 返答は自然な会話の長さ（長すぎない）にすること
 - キャラの口調・一人称を必ず守ること
+- 思考プロセス（thinking）は必要最小限に留め、簡潔にまとめること
 `.trim();
 
     const messagesWithSystem = [
@@ -339,13 +356,18 @@ ${character.scenario}
       ...messages,
     ];
 
-    const response = await ollamaClient.chat.completions.create({
-      model: OLLAMA_MODEL,
-      messages: messagesWithSystem,
-      stream: true,
-      // @ts-expect-error: Ollama 固有のパラメータ
-      num_predict: 2048,
-    });
+    const response = await ollamaClient.chat.completions.create(
+      {
+        model: OLLAMA_MODEL,
+        messages: messagesWithSystem,
+        stream: true,
+        // @ts-expect-error: Ollama 固有のパラメータ
+        num_predict: 2048,
+        // @ts-expect-error: Ollama 固有のパラメータ
+        repeat_penalty: 1.15,
+      },
+      { signal: req.signal }
+    );
 
     const encoder = new TextEncoder();
 
@@ -412,17 +434,22 @@ ${character.scenario}
 
               messagesForContinuation.push({
                 role: "system",
-                content: `${toolName}クエリ: ${event.query}\n\n検索結果:\n${formattedResults}\n\nこの検索結果を元に、キャラクターとして自然な会話の形で答えてください。`,
+                content: `${toolName}クエリ: ${event.query}\n\n検索結果:\n${formattedResults}\n\n上記の検索結果を元に、キャラクターとして自然な会話の形で**日本語で**簡潔に答えてください。返答は3〜5文程度にまとめること。余計な思考や前置きは不要です。`,
               });
 
               // 続きの返答を生成（ツール呼び出しは 1 回のみ）
-              const followUp = await ollamaClient.chat.completions.create({
-                model: OLLAMA_MODEL,
-                messages: messagesForContinuation,
-                stream: true,
-                // @ts-expect-error: Ollama 固有のパラメータ
-                num_predict: 2048,
-              });
+              const followUp = await ollamaClient.chat.completions.create(
+                {
+                  model: OLLAMA_MODEL,
+                  messages: messagesForContinuation,
+                  stream: true,
+                  // @ts-expect-error: Ollama 固有のパラメータ
+                  num_predict: 512,
+                  // @ts-expect-error: Ollama 固有のパラメータ
+                  repeat_penalty: 1.15,
+                },
+                { signal: req.signal }
+              );
 
               for await (const followUpEvent of parseThinkingStream(followUp)) {
                 if (followUpEvent.type === "done") {
@@ -462,6 +489,15 @@ ${character.scenario}
             sseJson(controller, encoder, payload);
           }
         } catch (error) {
+          // クライアントが切断した場合（停止ボタン）は静かに終了
+          if (
+            error instanceof Error &&
+            (error.name === "AbortError" || error.message.includes("aborted"))
+          ) {
+            console.log("[API/chat] クライアントによりストリームが中断されました");
+            try { controller.close(); } catch { /* already closed */ }
+            return;
+          }
           console.error("Stream error:", error);
           controller.error(error);
         }

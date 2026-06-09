@@ -79,6 +79,10 @@ export default function ChatPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const streamingReasoningRef = useRef<HTMLParagraphElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  // 停止時に途中テキストを参照するためのref
+  const streamingTextRef = useRef<string>("");
+  const streamingReasoningTextRef = useRef<string>("");
 
   useEffect(() => {
     async function fetchPlot() {
@@ -140,10 +144,15 @@ export default function ChatPage() {
     setStreamingSearchStatus(null);
     setStreamingSearchUrls([]);
     setStreamingSearchResults([]);
+    streamingTextRef.current = "";
+    streamingReasoningTextRef.current = "";
 
     inputRef.current?.focus();
 
     try {
+      const abortController = new AbortController();
+      abortControllerRef.current = abortController;
+
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -152,6 +161,7 @@ export default function ChatPage() {
           characterId: selectedCharacterId,
           messages: newMessages,
         }),
+        signal: abortController.signal,
       });
 
       if (!res.ok) throw new Error("Failed to get response");
@@ -182,12 +192,14 @@ export default function ChatPage() {
             // テキスト
             if (parsed.text) {
               assistantText += parsed.text;
+              streamingTextRef.current = assistantText;
               setStreamingText(assistantText);
             }
 
             // 思考プロセス
             if (parsed.reasoning) {
               assistantReasoning += parsed.reasoning;
+              streamingReasoningTextRef.current = assistantReasoning;
               setStreamingReasoning(assistantReasoning);
             }
 
@@ -247,11 +259,34 @@ export default function ChatPage() {
       setStreamingSearchUrls([]);
       setStreamingSearchResults([]);
       setIsStreaming(false);
+      abortControllerRef.current = null;
       inputRef.current?.focus();
     } catch (error) {
-      console.error("Chat error:", error);
+      // 停止ボタンによる中断 → 途中までのテキストをメッセージとして保存
+      if (error instanceof Error && error.name === "AbortError") {
+        const partialText = streamingTextRef.current;
+        const partialReasoning = streamingReasoningTextRef.current;
+        if (partialText) {
+          setMessages(prev => [
+            ...prev,
+            {
+              role: "assistant" as const,
+              content: partialText,
+              ...(partialReasoning ? { reasoning: partialReasoning } : {}),
+            },
+          ]);
+        }
+      } else {
+        console.error("Chat error:", error);
+        alert("エラーが発生しました");
+      }
+      setStreamingText("");
+      setStreamingReasoning("");
+      setStreamingSearchStatus(null);
+      setStreamingSearchUrls([]);
+      setStreamingSearchResults([]);
       setIsStreaming(false);
-      alert("エラーが発生しました");
+      abortControllerRef.current = null;
       inputRef.current?.focus();
     }
   };
@@ -261,6 +296,12 @@ export default function ChatPage() {
       e.preventDefault();
       e.stopPropagation();
       handleSend();
+    }
+  };
+
+  const handleStop = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
     }
   };
 
@@ -530,13 +571,28 @@ export default function ChatPage() {
             className="flex-1 bg-[#2a2a2a] border border-gray-700 rounded-full px-5 py-3 text-white placeholder-gray-500 focus:outline-none focus:border-[#7c3aed] transition-colors"
           />
           <button
-            onClick={handleSend}
-            disabled={!input.trim() || isStreaming}
-            className="bg-gradient-to-r from-[#7c3aed] to-[#a855f7] text-white px-6 py-3 rounded-full hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed"
+            onClick={isStreaming ? handleStop : handleSend}
+            disabled={isStreaming ? false : !input.trim()}
+            className={
+              isStreaming
+                ? "relative bg-[#0f0f0f] border border-[#7c3aed]/60 hover:border-[#a855f7] text-[#a855f7] hover:text-white px-6 py-3 rounded-full transition-all duration-200 shadow-[0_0_12px_rgba(124,58,237,0.25)] hover:shadow-[0_0_20px_rgba(168,85,247,0.4)] group"
+                : "bg-gradient-to-r from-[#7c3aed] to-[#a855f7] text-white px-6 py-3 rounded-full hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed"
+            }
+            title={isStreaming ? "生成を停止" : "送信"}
           >
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
-            </svg>
+            {isStreaming ? (
+              <>
+                {/* パルスリング */}
+                <span className="absolute inset-0 rounded-full border border-[#7c3aed]/30 animate-ping opacity-60" />
+                <svg className="w-5 h-5 relative" fill="currentColor" viewBox="0 0 24 24">
+                  <rect x="7" y="7" width="10" height="10" rx="1.5" />
+                </svg>
+              </>
+            ) : (
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+              </svg>
+            )}
           </button>
         </div>
       </div>
