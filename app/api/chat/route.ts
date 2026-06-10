@@ -38,12 +38,16 @@ async function* parseThinkingStream(
   let buffer = "";
   let inThinking = false;
 
-  // モデル固有のツール呼び出し構文
-  // call:web_search{query:<|"|>クエリ<|"|>}<tool_call|>
-  const WEB_SEARCH_RE =
-    /call:web_search\{query:<\|"?\|>([\s\S]+?)<\|"?\|>\}(?:<tool_call\|>)?/; // <tool_call|> は省略される場合があるため optional
-  const BLUESKY_RE =
-    /call:bluesky_search\{query:<\|"?\|>([\s\S]+?)<\|"?\|>\}(?:<tool_call\|>)?/; // <tool_call|> は省略される場合があるため optional
+  // モデル固有のツール呼び出し構文（複数パターンに対応）
+  // パターン1: call:web_search{query:<|"|>クエリ<|"|>}
+  // パターン2: call:web_search{query: "クエリ"}  ← 通常クォート・スペースあり
+  const TOOL_QUERY_RE = String.raw`(?:<\|"?\|>|")([\s\S]+?)(?:<\|"?\|>|")`;
+  const WEB_SEARCH_RE = new RegExp(
+    String.raw`call:web_search\{query:\s*` + TOOL_QUERY_RE + String.raw`\}(?:<tool_call\|>)?`
+  );
+  const BLUESKY_RE = new RegExp(
+    String.raw`call:bluesky_search\{query:\s*` + TOOL_QUERY_RE + String.raw`\}(?:<tool_call\|>)?`
+  );
 
   for await (const chunk of response) {
     const delta = chunk.choices[0]?.delta;
@@ -73,17 +77,17 @@ async function* parseThinkingStream(
     if (toolMatch) {
       const tool = webMatch ? "web_search" : "bluesky_search";
       const matchIndex = toolMatch.index!;
-      console.log();
 
       // ツール呼び出し前のテキストを流す
       if (matchIndex > 0) {
-        yield { type: "text", content: buffer.slice(0, matchIndex) };
+        yield { type: "text", content: sanitizeContent(buffer.slice(0, matchIndex)) };
       }
 
       yield { type: "tool_call", tool, query: toolMatch[1].trim() };
 
-      // ツール呼び出し部分より後のバッファを残す
-      buffer = buffer.slice(matchIndex + toolMatch[0].length);
+      // ツール呼び出しより後のテキストをバッファに残す（モデルが続けて返答を出した場合）
+      const after = buffer.slice(matchIndex + toolMatch[0].length).trimStart();
+      buffer = after;
       continue;
     }
 
@@ -151,15 +155,31 @@ async function* parseThinkingStream(
 
   // バッファ残りを吐き出す
   if (buffer.length > 0) {
-    // ストリーム終了時にまだ未完のツール呼び出しがバッファに残っている場合を警告
-    if (buffer.includes("call:")) {
-      console.warn(
-        "[parseThinkingStream] ストリーム終了時にツール呼び出しの可能性がある未処理バッファが残っています。\n" +
-        "  正規表現にマッチする前にストリームが終了した可能性があります。\n" +
-        "  buffer:", JSON.stringify(buffer.slice(0, 300))
-      );
+    // ストリーム終了時に改めてツール呼び出し正規表現を試みる
+    const finalWebMatch = buffer.match(WEB_SEARCH_RE);
+    const finalBskyMatch = buffer.match(BLUESKY_RE);
+    const finalToolMatch = finalWebMatch ?? finalBskyMatch;
+
+    if (finalToolMatch) {
+      const tool = finalWebMatch ? "web_search" : "bluesky_search";
+      const matchIndex = finalToolMatch.index!;
+      if (matchIndex > 0) {
+        yield { type: "text", content: sanitizeContent(buffer.slice(0, matchIndex)) };
+      }
+      yield { type: "tool_call", tool, query: finalToolMatch[1].trim() };
+      const after = buffer.slice(matchIndex + finalToolMatch[0].length).trimStart();
+      if (after) {
+        yield { type: "text", content: sanitizeContent(after) };
+      }
+    } else {
+      if (buffer.includes("call:")) {
+        console.warn(
+          "[parseThinkingStream] ストリーム終了時にツール呼び出しの可能性がある未処理バッファが残っています。\n" +
+          "  buffer:", JSON.stringify(buffer.slice(0, 300))
+        );
+      }
+      yield { type: inThinking ? "reasoning" : "text", content: sanitizeContent(buffer) };
     }
-    yield { type: inThinking ? "reasoning" : "text", content: sanitizeContent(buffer) };
   }
 
   yield { type: "done" };
@@ -452,24 +472,28 @@ ${character.scenario}
               );
 
               for await (const followUpEvent of parseThinkingStream(followUp)) {
+                if (streamEnded) break;
+
                 if (followUpEvent.type === "done") {
-                  // フォローアップ完了 → ストリーム終了
-                  controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                  controller.close();
-                  streamEnded = true;
-                  return; // start() を抜ける
+                  if (!streamEnded) {
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                    streamEnded = true;
+                  }
+                  return;
                 }
 
                 if (followUpEvent.type === "tool_call") {
-                  // 二重ツール呼び出しは無視（テキストとして扱わずスキップ）
                   continue;
                 }
 
-                const payload =
-                  followUpEvent.type === "reasoning"
-                    ? { reasoning: followUpEvent.content }
-                    : { text: followUpEvent.content };
-                sseJson(controller, encoder, payload);
+                if (!streamEnded) {
+                  const payload =
+                    followUpEvent.type === "reasoning"
+                      ? { reasoning: followUpEvent.content }
+                      : { text: followUpEvent.content };
+                  sseJson(controller, encoder, payload);
+                }
               }
 
               // フォローアップが done を返さず終了した場合の安全網
@@ -495,11 +519,19 @@ ${character.scenario}
             (error.name === "AbortError" || error.message.includes("aborted"))
           ) {
             console.log("[API/chat] クライアントによりストリームが中断されました");
+            streamEnded = true;
             try { controller.close(); } catch { /* already closed */ }
             return;
           }
+          // コントローラー既に閉じている場合は無視
+          if (
+            error instanceof Error &&
+            (error.message.includes("Controller is already closed") || (error as NodeJS.ErrnoException).code === "ERR_INVALID_STATE")
+          ) {
+            return;
+          }
           console.error("Stream error:", error);
-          controller.error(error);
+          try { controller.error(error); } catch { /* already closed */ }
         }
       },
     });
